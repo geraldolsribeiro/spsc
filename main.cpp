@@ -106,29 +106,38 @@ void consume_block(std::span<const std::byte> block) {
   std::ignore = checksum;
 }
 
-void consume(std::span<const Packet> batch) {
-  // Pack the variable-size packets into exact 11,200-byte blocks. A packet
-  // may cross a block boundary because the block format is a byte stream.
-  std::vector<std::byte> block(block_size); // Value-initialized: padding is zero.
-  std::size_t used = 0;
-  for (const auto &packet : batch) {
-    std::size_t offset = 0;
-    while (offset < packet.payload.size()) {
-      const auto count = std::min(block_size - used, packet.payload.size() - offset);
-      std::copy_n(packet.payload.data() + offset, count, block.data() + used);
-      used += count;
-      offset += count;
-      if (used == block_size) {
-        consume_block(block);
-        std::fill(block.begin(), block.end(), std::byte{0});
-        used = 0;
+class BlockAssembler {
+public:
+  // Keep the partial block between consumer batches. This is important: if
+  // every batch were padded independently, each batch could lose bytes.
+  void add(std::span<const Packet> packets) {
+    for (const auto &packet : packets) {
+      std::size_t offset = 0;
+      while (offset < packet.payload.size()) {
+        const auto count = std::min(block_size - used_, packet.payload.size() - offset);
+        std::copy_n(packet.payload.data() + offset, count, block_.data() + used_);
+        used_ += count;
+        offset += count;
+        if (used_ == block_size) {
+          consume_block(block_);
+          std::fill(block_.begin(), block_.end(), std::byte{0});
+          used_ = 0;
+        }
       }
     }
   }
-  // Flush the final partial block after zero-padding its unused tail.
-  if (used != 0)
-    consume_block(block);
-}
+
+  void finish() {
+    // Only the final partial block is padded, minimizing both block count and
+    // the total number of zero-padding bytes for the complete stream.
+    if (used_ != 0)
+      consume_block(block_);
+  }
+
+private:
+  std::vector<std::byte> block_{block_size}; // Value-initialized zero padding.
+  std::size_t used_ = 0;
+};
 } // namespace
 
 int main(int argc, char **argv) {
@@ -163,16 +172,18 @@ int main(int argc, char **argv) {
   // The consumer processes a full batch whenever possible. If traffic is
   // sparse, take_batch wakes at the deadline and returns the partial batch.
   std::jthread consumer([&](std::stop_token stop) {
+    BlockAssembler assembler;
     while (!stop.stop_requested()) {
       auto batch = queue.take_batch(std::chrono::microseconds(timeout_us), stop);
       if (batch.empty())
         break;
-      consume(batch);
+      assembler.add(batch);
       consumed += batch.size();
       for (const auto &packet : batch)
         consumed_bytes += packet.payload.size();
       ++batches;
     }
+    assembler.finish();
   });
 
   const auto    report_start            = std::chrono::steady_clock::now();
