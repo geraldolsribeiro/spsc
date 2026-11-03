@@ -79,6 +79,10 @@ public:
         batch.push_back(std::move(queue_.front()));
         queue_.pop_front();
       }
+      // The next packet does not fit under the strict limit. Return now;
+      // otherwise the predicate remains true and this loop would spin.
+      if (!queue_.empty() && bytes + queue_.front().payload.size() >= batch_limit)
+        break;
     }
     return batch;
   }
