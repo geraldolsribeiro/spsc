@@ -165,18 +165,16 @@ void consume_block(std::span<const std::byte> block) {
   std::ignore = checksum;
 }
 
-// Batch-to-block conversion (partial data is carried across batches):
+// Batch-to-block conversion is independent for each batch:
 //
-//   batch 1: [packet][packet][packet]----+
-//   batch 2: [packet][packet]------------+--> continuous byte stream
-//                                             |                 |
-//                                             +--> [11200 B] --> consume_block()
-//                                             +--> [11200 B] --> consume_block()
-//                                             +--> [tail][zero padding]
+//   batch 1: [packet][packet][packet] --> [11200 B] ... [tail + zero padding]
+//   batch 2: [packet][packet]-------- --> [11200 B] ... [tail + zero padding]
+//
+// Blocks never contain bytes from different batches.
 class BlockAssembler {
 public:
-  // Keep the partial block between consumer batches. This is important: if
-  // every batch were padded independently, each batch could lose bytes.
+  // Assemble only this batch. The partial block is padded when finish() is
+  // called; it is never carried into the next batch.
   void add(std::span<const Packet> packets) {
     // Packets are treated as a continuous byte stream; a packet may cross a
     // block boundary and is never padded individually.
@@ -189,8 +187,8 @@ public:
         std::copy_n(packet.payload.data() + offset, count, block_.data() + used_);
         used_ += count;
         offset += count;
-        // Full blocks are delivered immediately. used_ persists across
-        // consumer batches, which minimizes padding.
+        // Full blocks are delivered immediately. used_ persists only while
+        // this batch is being assembled.
         if (used_ == block_size) {
           consume_block(block_);
           std::fill(block_.begin(), block_.end(), std::byte{0});
@@ -201,8 +199,8 @@ public:
   }
 
   void finish() {
-    // Only the final partial block is padded, minimizing both block count and
-    // the total number of zero-padding bytes for the complete stream.
+    // The final partial block of this batch is padded with zeros. This is
+    // required even when another batch will be processed later.
     if (used_ != 0)
       consume_block(block_);
   }
@@ -223,7 +221,7 @@ int main(int argc, char **argv) {
   // The producer uses a separate thread so generation and sleeping never block
   // the consumer; the consumer can process queued packets concurrently.
 
-  SpscQueue                  queue;
+  SpscQueue queue;
   // These counters are read by the reporting code while worker threads update
   // them, so they must be atomic. The queue itself does not need atomics here
   // because its mutex also provides the required synchronization.
@@ -264,20 +262,22 @@ int main(int argc, char **argv) {
   //
   // Shutdown sequence:
   //   main -> stop producer -> producer closes queue -> consumer drains queue
-  //        -> consumer finishes/pads final block -> both threads join.
+  //        -> consumer finishes each batch -> both threads join.
   std::jthread consumer([&](std::stop_token stop) {
-    BlockAssembler assembler;
     while (!stop.stop_requested()) {
       auto batch = queue.take_batch(std::chrono::microseconds(timeout_us), stop);
       if (batch.empty())
         break;
+      // The assembler belongs to this iteration: blocks cannot combine
+      // packets from this batch with packets from a later batch.
+      BlockAssembler assembler;
       assembler.add(batch);
+      assembler.finish();
       consumed += batch.size();
       for (const auto &packet : batch)
         consumed_bytes += packet.payload.size();
       ++batches;
     }
-    assembler.finish();
   });
 
   const auto    report_start            = std::chrono::steady_clock::now();
