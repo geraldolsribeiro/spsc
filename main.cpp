@@ -18,11 +18,10 @@
 
 namespace {
 using namespace std::chrono_literals;
-// Network packet and batching requirements. The range covers a small Ethernet
-// ping frame through a typical jumbo frame. The payload size is variable.
-constexpr std::size_t   min_packet_size   = 64;
-constexpr std::size_t   max_packet_size   = 9000;
-constexpr std::size_t   batch_limit       = 65'000;     // Strictly less than 65 kB.
+// Packet-size distribution: 98% standard packets and 2% small packets.
+constexpr std::size_t   standard_packet_size = 1500;
+constexpr std::size_t   small_packet_size    = 60;
+constexpr std::size_t   batch_limit       = 65'000; // Strictly less than 65 kB.
 constexpr std::size_t   block_size        = 11'200;
 constexpr std::uint64_t producer_rate_bps = 40'000'000; // 40 Mbit/s.
 
@@ -49,8 +48,8 @@ public:
   // than timeout for more packets, or returns immediately when it is full.
   std::vector<Packet> take_batch(std::chrono::microseconds timeout, std::stop_token stop) {
     std::vector<Packet> batch;
-    // Reserve for the worst case (small packets produce the most entries).
-    batch.reserve(batch_limit / min_packet_size);
+    // Reserve for the worst case (60-byte packets produce the most entries).
+    batch.reserve(batch_limit / small_packet_size);
     std::unique_lock lock(mutex_);
 
     auto wake = [&] { return !queue_.empty() || closed_ || stop.stop_requested(); };
@@ -70,7 +69,7 @@ public:
 
     // Keep filling the batch, rather than waking and processing a small
     // batch for every packet. The deadline starts at the first packet.
-    while (bytes + min_packet_size < batch_limit && !closed_ && !stop.stop_requested()) {
+    while (bytes + small_packet_size < batch_limit && !closed_ && !stop.stop_requested()) {
       if (!not_empty_.wait_until(lock, deadline, [&] { return !queue_.empty() || closed_ || stop.stop_requested(); })) {
         break;
       }
@@ -140,7 +139,7 @@ public:
 
 private:
   std::vector<std::byte> block_{block_size}; // Value-initialized zero padding.
-  std::size_t used_ = 0;
+  std::size_t            used_ = 0;
 };
 } // namespace
 
@@ -159,10 +158,11 @@ int main(int argc, char **argv) {
   // shutdown. sleep_until keeps the producer from accumulating drift.
   std::jthread producer([&](std::stop_token stop) {
     std::mt19937                               generator(std::random_device{}());
-    std::uniform_int_distribution<std::size_t> sizes(min_packet_size, max_packet_size);
-    auto                                       next = std::chrono::steady_clock::now();
+    std::uniform_int_distribution<int> packet_kind(0, 99);
+    auto                                next = std::chrono::steady_clock::now();
     while (!stop.stop_requested()) {
-      const auto size = sizes(generator);
+      // 98 values select 1500 bytes; 2 values select 60 bytes.
+      const auto size = packet_kind(generator) < 98 ? standard_packet_size : small_packet_size;
       queue.push(Packet(size));
       ++produced;
       produced_bytes += size;
