@@ -1,13 +1,9 @@
 # SPSC packet batching
 
-A C++20 single-producer/single-consumer example. The producer emits 1500-byte
-packets at 40 Mbit/s (about one packet every 300 microseconds). The consumer
-batches packets until the batch is full or until `T` microseconds have elapsed
-since the first packet in the batch.
-
-
-Because the limit is strictly less than 65,000 bytes, a full batch contains 43
-packets (64,500 bytes).
+A C++20 single-producer/single-consumer example. The producer emits variable-size
+packets from 64-byte ping frames through 9000-byte jumbo frames at 40 Mbit/s.
+The consumer batches packets until adding the next packet would reach 65,000
+bytes, or until `T` microseconds have elapsed since the first packet.
 
 ## Build and run
 
