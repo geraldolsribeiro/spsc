@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -22,6 +23,7 @@ using namespace std::chrono_literals;
 constexpr std::size_t   min_packet_size   = 64;
 constexpr std::size_t   max_packet_size   = 9000;
 constexpr std::size_t   batch_limit       = 65'000;     // Strictly less than 65 kB.
+constexpr std::size_t   block_size        = 11'200;
 constexpr std::uint64_t producer_rate_bps = 40'000'000; // 40 Mbit/s.
 
 struct Packet {
@@ -96,13 +98,36 @@ private:
   bool                    closed_ = false;
 };
 
-void consume(std::span<const Packet> batch) {
-  // Replace this with the actual batch operation. Touching the data prevents
-  // an optimizing compiler from treating the simulated work as irrelevant.
+void consume_block(std::span<const std::byte> block) {
+  // Replace this with the actual fixed-size block operation.
   std::uint8_t checksum = 0;
-  for (const auto &packet : batch)
-    checksum ^= std::to_integer<std::uint8_t>(packet.payload.front());
+  for (const auto byte : block)
+    checksum ^= std::to_integer<std::uint8_t>(byte);
   std::ignore = checksum;
+}
+
+void consume(std::span<const Packet> batch) {
+  // Pack the variable-size packets into exact 11,200-byte blocks. A packet
+  // may cross a block boundary because the block format is a byte stream.
+  std::vector<std::byte> block(block_size); // Value-initialized: padding is zero.
+  std::size_t used = 0;
+  for (const auto &packet : batch) {
+    std::size_t offset = 0;
+    while (offset < packet.payload.size()) {
+      const auto count = std::min(block_size - used, packet.payload.size() - offset);
+      std::copy_n(packet.payload.data() + offset, count, block.data() + used);
+      used += count;
+      offset += count;
+      if (used == block_size) {
+        consume_block(block);
+        std::fill(block.begin(), block.end(), std::byte{0});
+        used = 0;
+      }
+    }
+  }
+  // Flush the final partial block after zero-padding its unused tail.
+  if (used != 0)
+    consume_block(block);
 }
 } // namespace
 
