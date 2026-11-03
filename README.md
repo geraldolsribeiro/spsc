@@ -7,13 +7,13 @@ batches, and convert every batch into fixed-size blocks.
 ## Architecture
 
 ```text
-+----------+       SpscQueue        +----------+       +----------------+
++----------+        SpscQueue        +----------+       +----------------+
 | Producer | -- Packet ------------> | Consumer | ----> | BlockAssembler |
 +----------+                         +----------+       +----------------+
   98% x 1500 B                           |              11,200 B blocks
    2% x 60 B                             v                      |
-  40 Mbit/s                       batch < 65,000 B             v
-                                                        consume_block()
+  40 Mbit/s                       batch < 65,000 B              v
+                                                         consume_block()
 ```
 
 There is one producer thread and one consumer thread. `SpscQueue` uses a
@@ -65,7 +65,7 @@ bytes from different batches:
 
 ```text
 batch 1: [packet][packet][packet] -> [11,200 B] ... [tail + zero padding]
-batch 2: [packet][packet]--------- -> [11,200 B] ... [tail + zero padding]
+batch 2: [packet][packet]-------- -> [11,200 B] ... [tail + zero padding]
 ```
 
 If a batch does not end on a block boundary, its final block is zero-padded.

@@ -23,14 +23,14 @@ using namespace std::chrono_literals;
 //
 //   +----------+       Packet queue        +----------+      65 kB batch
 //   | Producer | --push(Packet)----------> | Consumer | ------------------+
-//   +----------+                           +----------+                    |
-//        |                                      |                          v
-//        | 98% x 1500 B, 2% x 60 B              | BlockAssembler
-//        | 40 Mbit/s                             v
-//        +------------------------------> [11,200 B][11,200 B]...[tail+0]
-//                                                        |
-//                                                        v
-//                                               consume_block(block)
+//   +----------+                           +----------+                   |
+//        |                                                                v
+//        | 98% x 1500 B, 2% x 60 B                                  BlockAssembler
+//        | 40 Mbit/s                                                      v
+//                                                          [11,200 B][11,200 B]...[tail+0]
+//                                                                         |
+//                                                                         v
+//                                                               consume_block(block)
 //
 // The program models a byte stream made of packets. A consumer batch is kept
 // below 65,000 bytes, then the stream is repacked into fixed 11,200-byte
@@ -58,11 +58,11 @@ struct Packet {
 // means no additional producers or consumers should be added.
 // Queue ownership and synchronization:
 //
-//   producer thread                         consumer thread
-//        |                                      |
+//   producer thread                       consumer thread
+//        |                                     |
 //        +-- lock -> [ deque<Packet> ] <- lock-+
 //                         |
-//                    condition_variable
+//                 condition_variable
 //
 // Only one thread calls push() and only one thread calls take_batch().
 class SpscQueue {
