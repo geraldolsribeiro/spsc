@@ -43,6 +43,10 @@ constexpr std::size_t   batch_limit          = 65'000; // Strictly less than 65 
 constexpr std::size_t   block_size           = 11'200;
 constexpr std::uint64_t producer_rate_bps    = 40'000'000; // 40 Mbit/s.
 
+// Packet is a named domain type instead of exposing vector<byte> everywhere.
+// This gives packet data a clear meaning, allows packet-specific metadata or
+// validation to be added later, and prevents accidentally passing arbitrary
+// byte vectors where a packet is required. The payload remains variable-size.
 struct Packet {
   std::vector<std::byte> payload;
 
@@ -66,6 +70,10 @@ public:
   // The producer transfers ownership of the packet into the queue. The lock
   // protects both the deque and the condition-variable state, and is released
   // before notifying the consumer.
+  //
+  // push_back(std::move(packet)) moves the Packet into the deque instead of
+  // copying its vector payload. Moving a vector transfers its allocation and
+  // is normally O(1); copying would allocate and copy every payload byte.
   void push(Packet packet) {
     {
       std::lock_guard lock(mutex_);
@@ -74,6 +82,10 @@ public:
     not_empty_.notify_one();
   }
 
+  // std::span is a non-owning view: it passes a contiguous range without
+  // copying it or transferring ownership. It accepts vector-backed data while
+  // keeping this API usable with arrays or other contiguous storage.
+  //
   // Waits for the first packet. Once a batch has started, waits no longer
   // than timeout for more packets, or returns immediately when it is full.
   std::vector<Packet> take_batch(std::chrono::microseconds timeout, std::stop_token stop) {
@@ -85,6 +97,9 @@ public:
 
     // Waiting avoids polling. The predicate also handles spurious wake-ups.
     auto wake = [&] { return !queue_.empty() || closed_ || stop.stop_requested(); };
+    // wait(lock, predicate) has no deadline: it sleeps until notified, then
+    // rechecks the predicate. It is appropriate here because the first packet
+    // has no batch deadline yet; spurious wake-ups are handled by the predicate.
     not_empty_.wait(lock, wake);
     // An empty result means shutdown or a stop request.
     if (queue_.empty())
@@ -104,6 +119,9 @@ public:
     // Keep filling the batch, rather than processing one packet at a time.
     // The deadline starts at the first packet and is not reset per packet.
     while (bytes + small_packet_size < batch_limit && !closed_ && !stop.stop_requested()) {
+      // wait_until is the timed counterpart to wait. It sleeps until either
+      // a notification/predicate change or the absolute deadline. An absolute
+      // deadline prevents repeated wake-ups from extending the total timeout.
       if (!not_empty_.wait_until(lock, deadline, [&] { return !queue_.empty() || closed_ || stop.stop_requested(); })) {
         break;
       }
@@ -135,6 +153,8 @@ private:
   bool                    closed_ = false;
 };
 
+// std::span is also used here because consume_block only observes the block;
+// it must not own, resize, or copy the assembler's storage.
 // This represents the actual downstream operation. The checksum is only a
 // placeholder that makes the example touch every byte.
 void consume_block(std::span<const std::byte> block) {
@@ -200,14 +220,25 @@ int main(int argc, char **argv) {
   const auto run_seconds = argc > 2 ? std::strtoull(argv[2], nullptr, 10) : 5;
   // The interval is calculated per packet: variable packet sizes still average
   // the requested 40 Mbit/s. steady_clock avoids wall-clock adjustments.
+  // The producer uses a separate thread so generation and sleeping never block
+  // the consumer; the consumer can process queued packets concurrently.
 
   SpscQueue                  queue;
+  // These counters are read by the reporting code while worker threads update
+  // them, so they must be atomic. The queue itself does not need atomics here
+  // because its mutex also provides the required synchronization.
   std::atomic<std::uint64_t> produced{0}, produced_bytes{0};
   std::atomic<std::uint64_t> consumed{0}, consumed_bytes{0};
   std::atomic<std::uint64_t> batches{0};
 
   // jthread automatically joins, while stop_token provides cooperative
   // shutdown. sleep_until keeps the producer from accumulating drift.
+  //
+  // sleep_until(next) uses a schedule of absolute instants. If one iteration
+  // runs late, the next sleep is shortened, so small delays do not accumulate.
+  // sleep_for(interval) would measure every interval after the previous work
+  // completed and would gradually slow the producer due to scheduling and
+  // queue-operation overhead.
   std::jthread producer([&](std::stop_token stop) {
     std::mt19937                       generator(std::random_device{}());
     std::uniform_int_distribution<int> packet_kind(0, 99);
@@ -221,6 +252,8 @@ int main(int argc, char **argv) {
       // Larger packets need longer intervals to maintain 40 Mbps.
       const auto interval = std::chrono::duration<double>(static_cast<double>(size * 8) / producer_rate_bps);
       next += std::chrono::duration_cast<std::chrono::steady_clock::duration>(interval);
+      // steady_clock is monotonic, so wall-clock adjustments cannot change
+      // the packet schedule. sleep_until waits for the next absolute target.
       std::this_thread::sleep_until(next);
     }
     queue.close();
